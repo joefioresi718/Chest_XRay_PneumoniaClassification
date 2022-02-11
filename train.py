@@ -1,0 +1,446 @@
+import datetime
+import dataloader
+import numpy as np
+import os
+from matplotlib import pyplot as plt
+import time
+import torch
+import torch.utils.data
+from torch import nn
+import torchvision
+import transforms as T
+import utils
+import wandb
+from sklearn.metrics import classification_report
+
+
+try:
+    from apex import amp
+except ImportError:
+    amp = None
+
+
+def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, print_freq, apex=False):
+    model.train()
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value}'))
+    metric_logger.add_meter('img/s', utils.SmoothedValue(window_size=10, fmt='{value}'))
+
+    header = 'Epoch: [{}]'.format(epoch)
+    for image, target in metric_logger.log_every(data_loader, print_freq, header):
+        start_time = time.time()
+        image, target = image.to(device), target.to(device)
+        output = model(image)
+        loss = criterion(output, target)
+
+        optimizer.zero_grad()
+        if apex:
+            with amp.scale_loss(loss, optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            loss.backward()
+        optimizer.step()
+
+        acc = utils.accuracy(output, target)
+        batch_size = image.shape[0]
+        metric_logger.update(loss=loss.item(), lr=optimizer.param_groups[0]["lr"])
+        metric_logger.meters['acc'].update(acc[0].item(), n=batch_size)
+        metric_logger.meters['img/s'].update(batch_size / (time.time() - start_time))
+
+    return metric_logger.loss.value, metric_logger.acc.value
+
+
+def evaluate(model, criterion, data_loader, visualize, output_dir, device, print_freq=100):
+    model.eval()
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    header = 'Test:'
+    idx = 1
+    target_class = torch.Tensor([])
+    pred_class = torch.Tensor([])
+    with torch.no_grad():
+        for image, target in metric_logger.log_every(data_loader, print_freq, header):
+            if visualize:
+                im = image
+
+            target_class = torch.cat((target_class, target), dim=0)
+
+            image = image.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
+            output = model(image)
+            _, pred = output.topk(1, 1, True, True)
+            loss = criterion(output, target)
+
+            acc = utils.accuracy(output, target)
+
+            pred_class = torch.cat((pred_class, pred.cpu()), dim=0)
+
+            batch_size = image.shape[0]
+            metric_logger.update(loss=loss.item())
+            metric_logger.meters['acc'].update(acc[0].item(), n=batch_size)
+
+            if visualize:
+                for i in range(len(im)):
+                    orig_img = np.moveaxis(im[i].numpy(), 0, -1) * .2 + .5
+                    fig, ax = plt.subplots()
+                    ax.imshow(orig_img, cmap='gray', vmin=0, vmax=1)
+                    ax.set_title('Cell' + str(idx))
+                    ax.tick_params(axis='both', labelsize=0, length=0)
+                    ax.set(xlabel=("Predicted Label: " + str(pred.t()[0][i].item()) + ' Actual: ' + str(target.cpu()[i].item())))
+                    fig.savefig(output_dir + 'visualize/' + str(idx) + '.png')
+                    plt.close('all')
+                    idx += 1
+
+            # free memory
+            del image
+            del target
+            del output
+    # target_names = ['Clean', 'E1 25-75mm Crack <2/cell', 'E1 >75mm Crack', 'E1 x-BB Crack', 'E2 Fishbone', 'E3 Solder',
+    #                 'E4 Dead Cell', 'E5 Chip <=5%', 'E5 Chip >5%', 'E6 Fingers <=5%', 'E6 Fingers >5%',
+    #                 'E7 Current Mismatch', 'E8 Dark Spot <=10%', 'E8 Dark Spot >10%', 'E9 Firing Belt',
+    #                 'E10 Wafer Impurity', 'EL Scratch', 'Glass', 'Frame',	'Sealant', 'Backsheet', 'Cables',
+    #                 'X-crack <25mm', 'Wild_2', 'Wild_3']
+    target_names = ['Normal', 'Pneumonia']
+    results = classification_report(target_class, pred_class, target_names=target_names)
+    print(results)
+
+    # free classification report var
+    del target_class
+    del pred_class
+
+    # gather the stats from all processes
+    metric_logger.synchronize_between_processes()
+
+    print(' * Acc {top1.global_avg:.3f}'
+          .format(top1=metric_logger.acc))
+    return metric_logger.loss.value, metric_logger.acc.value
+
+
+def _get_cache_path(filepath):
+    import hashlib
+    h = hashlib.sha1(filepath.encode()).hexdigest()
+    cache_path = os.path.join("~", ".torch", "vision", "datasets", "imagefolder", h[:10] + ".pt")
+    cache_path = os.path.expanduser(cache_path)
+    return cache_path
+
+
+def load_data(traindir, valdir, testdir, args):
+    # Data loading code
+    resize_size, crop_size = (342, 299) if args.model == 'inception_v3' else (256, 224)
+
+    st = time.time()
+    cache_path = _get_cache_path(traindir)
+    if args.cache_dataset and os.path.exists(cache_path):
+        # Attention, as the transforms are also cached!
+        print("Loading dataset_train from {}".format(cache_path))
+        dataset, _ = torch.load(cache_path)
+    else:
+        # auto_augment_policy = getattr(args, "auto_augment", None)
+        # random_erase_prob = getattr(args, "random_erase", 0.0)
+        dataset = torchvision.datasets.ImageFolder(
+            traindir,
+            get_transform(True, base_size=resize_size, crop_size=crop_size))
+        # dataset = dataloader.ProductionLineAnalysisDataset(anno_dir=args.anno_dir, img_path=args.data_path,
+        #                                                    transform=get_transform(True, resize_size, crop_size),
+        #                                                    test_mode=False)
+        if args.cache_dataset:
+            print("Saving dataset_train to {}".format(cache_path))
+            utils.mkdir(os.path.dirname(cache_path))
+            utils.save_on_master((dataset, traindir), cache_path)
+    # print("Took", time.time() - st)
+
+    # loading test data
+    cache_path = _get_cache_path(valdir)
+    if args.cache_dataset and os.path.exists(cache_path):
+        # Attention, as the transforms are also cached!
+        print("Loading dataset_test from {}".format(cache_path))
+        dataset_test, _ = torch.load(cache_path)
+    else:
+        dataset_test = torchvision.datasets.ImageFolder(
+            valdir,
+            get_transform(False, base_size=resize_size, crop_size=crop_size))
+        # dataset_test = dataloader.ProductionLineAnalysisDataset(anno_dir=args.anno_dir, img_path=args.data_path,
+        #                                                         transform=get_transform(False, resize_size, crop_size),
+        #                                                         test_mode=True)
+        if args.cache_dataset:
+            print("Saving dataset_test to {}".format(cache_path))
+            utils.mkdir(os.path.dirname(cache_path))
+            utils.save_on_master((dataset_test, valdir), cache_path)
+
+        # loading testonly data
+        cache_path = _get_cache_path(testdir)
+        if args.cache_dataset and os.path.exists(cache_path):
+            # Attention, as the transforms are also cached!
+            print("Loading dataset_testonly from {}".format(cache_path))
+            dataset_testonly, _ = torch.load(cache_path)
+        else:
+            dataset_testonly = torchvision.datasets.ImageFolder(
+                testdir,
+                get_transform(False, base_size=resize_size, crop_size=crop_size))
+            # dataset_test = dataloader.ProductionLineAnalysisDataset(anno_dir=args.anno_dir, img_path=args.data_path,
+            #                                                         transform=get_transform(False, resize_size, crop_size),
+            #                                                         test_mode=True)
+            if args.cache_dataset:
+                print("Saving dataset_testonly to {}".format(cache_path))
+                utils.mkdir(os.path.dirname(cache_path))
+                utils.save_on_master((dataset_testonly, testdir), cache_path)
+
+    # creating data loaders
+    if args.distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
+        test_sampler = torch.utils.data.distributed.DistributedSampler(dataset_test)
+        testonly_sampler = torch.utils.data.distributed.DistributedSampler(dataset_testonly)
+    else:
+        train_sampler = torch.utils.data.RandomSampler(dataset)
+        test_sampler = torch.utils.data.SequentialSampler(dataset_test)
+        testonly_sampler = torch.utils.data.SequentialSampler(dataset_testonly)
+
+    return dataset, dataset_test, train_sampler, test_sampler, dataset_testonly, testonly_sampler
+
+
+# takes in boolean for train vs. test transforms
+def get_transform(train, base_size, crop_size):
+    min_size = int((0.6 if train else 1.0) * base_size)
+    max_size = int((1.5 if train else 1.0) * base_size)
+    transforms = [T.RandomResize(min_size, max_size)]
+    if train:
+        transforms.append(T.RandomCrop(crop_size))
+        # transforms.append(torchvision.transforms.RandomResizedCrop(250, scale=(0.6, 1.0), ratio=(0.75, 1.3333333333)))
+        transforms.append(T.RandomHorizontalFlip(0.5))
+        transforms.append(T.RandomVerticalFlip(0.5))
+        transforms.append(T.RandomRotate90(0.5))
+        # transforms.append(T.RandomMinorRotate(5))
+        transforms.append(T.GaussianBlur((7, 7), 2))
+    else:
+        transforms.append(T.CenterCrop(crop_size))
+    transforms.append(T.ToTensor())
+    transforms.append(T.Normalize(mean=.5, std=.2))
+
+    return T.Compose(transforms)
+
+
+def main(args):
+    if args.apex and amp is None:
+        raise RuntimeError("Failed to import apex. Please install apex from https://www.github.com/nvidia/apex "
+                           "to enable mixed-precision training.")
+
+    if args.output_dir:
+        utils.mkdir(args.output_dir)
+        utils.mkdir('save_models/' + args.output_dir)
+        if args.visualize:
+            utils.mkdir(args.output_dir + 'visualize/')
+
+    utils.init_distributed_mode(args)
+    print(args)
+
+    device = torch.device(args.device)
+
+    torch.backends.cudnn.benchmark = True
+
+    train_dir = os.path.join(args.data_path, 'train')
+    val_dir = os.path.join(args.data_path, 'val')
+    test_dir = os.path.join(args.data_path, 'test')
+    dataset, dataset_test, train_sampler, test_sampler, dataset_testonly, testonly_sampler = load_data(train_dir, val_dir, test_dir, args)
+    data_loader = torch.utils.data.DataLoader(
+        dataset, batch_size=args.batch_size,
+        sampler=train_sampler, num_workers=args.workers, pin_memory=True)
+
+    data_loader_test = torch.utils.data.DataLoader(
+        dataset_test, batch_size=args.batch_size,
+        sampler=test_sampler, num_workers=args.workers, pin_memory=True)
+
+    data_loader_testonly = torch.utils.data.DataLoader(
+        dataset_testonly, batch_size=args.batch_size,
+        sampler=testonly_sampler, num_workers=args.workers, pin_memory=True)
+
+    # creating model
+    model = torchvision.models.__dict__[args.model](pretrained=args.pretrained)
+
+    if args.pretrained & (args.model == 'resnet101'):
+        count = 0
+        for child in model.children():
+            count += 1
+            if count == 7:
+                break
+            for param in child.parameters():
+                param.requires_grad = False
+
+    model.to(device)
+    if args.distributed and args.sync_bn:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+
+    criterion = nn.CrossEntropyLoss()
+
+    opt_name = args.opt.lower()
+    if opt_name == 'sgd':
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+    elif opt_name == 'rmsprop':
+        optimizer = torch.optim.RMSprop(model.parameters(), lr=args.lr, momentum=args.momentum,
+                                        weight_decay=args.weight_decay, eps=0.0316, alpha=0.9)
+    else:
+        raise RuntimeError("Invalid optimizer {}. Only SGD and RMSprop are supported.".format(args.opt))
+
+    if args.apex:
+        model, optimizer = amp.initialize(model, optimizer,
+                                          opt_level=args.apex_opt_level
+                                          )
+
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step_size, gamma=args.lr_gamma)
+
+    model_without_ddp = model
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model_without_ddp = model.module
+
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location='cpu')
+        model_without_ddp.load_state_dict(checkpoint['model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+        args.start_epoch = checkpoint['epoch'] + 1
+
+    if args.test_only:
+        evaluate(model, criterion, data_loader_testonly, args.visualize, args.output_dir, device=device)
+        return
+
+    if args.wandb:
+        # for weights and bias tracking
+        wandb.init(project="cap5516assignment1", entity="joefioresi718")
+
+        # weights and bias tracking setup
+        wandb.config = {
+            "learning_rate": args.lr,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size
+        }
+
+    # start training
+    start_time = time.time()
+    best_loss = 1
+    for epoch in range(args.start_epoch + 1, args.epochs + 1):
+        if args.distributed:
+            train_sampler.set_epoch(epoch)
+        loss_train, acc_train = train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args.print_freq, args.apex)
+        lr_scheduler.step()
+        loss_val, acc_val = evaluate(model, criterion, data_loader_test, False, args.output_dir, device=device)
+
+        if args.wandb:
+            # log loss and accuracies
+            wandb.log({
+                "val_loss": loss_val,
+                "train_loss": loss_train,
+                "val_acc": acc_val,
+                "train_acc": acc_train
+            })
+            # Optional
+            wandb.watch(model)
+
+        if args.output_dir:
+            checkpoint = {
+                'model': model_without_ddp.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'lr_scheduler': lr_scheduler.state_dict(),
+                'epoch': epoch,
+                'args': args}
+            utils.save_on_master(
+                checkpoint,
+                os.path.join('save_models/' + args.output_dir, 'model_{}.pth'.format(epoch)))
+            utils.save_on_master(
+                checkpoint,
+                os.path.join('save_models/' + args.output_dir, 'checkpoint.pth'))
+            if loss_val < best_loss:
+                best_loss = loss_val
+                utils.save_on_master(checkpoint, os.path.join(args.output_dir, 'best_model.pth'))
+
+    if args.visualize:
+        checkpoint = torch.load(os.path.join(args.output_dir, 'best_model.pth'), map_location='cpu')
+        model.load_state_dict(checkpoint['model'], strict=not args.test_only)
+        test_loss, test_acc = evaluate(model, criterion, data_loader_testonly, True, args.output_dir, device=device)
+        if args.wandb:
+            # log loss and accuracies
+            wandb.log({
+                "test_loss": test_loss,
+                "test_acc": test_acc
+            })
+
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    print('Training time {}'.format(total_time_str))
+
+
+def get_args_parser(add_help=True):
+    import argparse
+    parser = argparse.ArgumentParser(description='PyTorch Classification Training', add_help=add_help)
+
+    parser.add_argument('--wandb', default=True, help='weights and bias')
+    parser.add_argument('--data-path', default='../../../datasets/chest_xray/', help='dataset')
+    parser.add_argument('--anno-dir', default='files/')
+    parser.add_argument('--model', default='resnet50', help='model')
+    parser.add_argument('--device', default='cuda', help='device')
+    parser.add_argument('-b', '--batch-size', default=16, type=int)
+    parser.add_argument('--epochs', default=50, type=int, metavar='N',
+                        help='number of total epochs to run')
+    parser.add_argument('-j', '--workers', default=8, type=int, metavar='N',
+                        help='number of data loading workers (default: 16)')
+    parser.add_argument('--opt', default='sgd', type=str, help='optimizer')
+    parser.add_argument('--lr', default=0.1, type=float, help='initial learning rate')
+    parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
+                        help='momentum')
+    parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
+                        metavar='W', help='weight decay (default: 1e-4)',
+                        dest='weight_decay')
+    parser.add_argument('--lr-step-size', default=30, type=int, help='decrease lr every step-size epochs')
+    parser.add_argument('--lr-gamma', default=0.1, type=float, help='decrease lr by a factor of lr-gamma')
+    parser.add_argument('--print-freq', default=10, type=int, help='print frequency')
+    parser.add_argument('--output-dir', default='Test/', help='path where to save')
+    parser.add_argument('--resume', default='', help='resume from checkpoint')
+    parser.add_argument('--visualize', default=True, action='store_true', help='visualize output')
+    parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
+                        help='start epoch')
+    parser.add_argument(
+        "--cache-dataset",
+        dest="cache_dataset",
+        help="Cache the datasets for quicker initialization. It also serializes the transforms",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--sync-bn",
+        dest="sync_bn",
+        help="Use sync batch norm",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--test-only",
+        dest="test_only",
+        help="Only test the model",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--pretrained",
+        dest="pretrained",
+        default=False,
+        help="Use pre-trained models from the modelzoo",
+        action="store_true",
+    )
+    # parser.add_argument('--auto-augment', default=None, help='auto augment policy (default: None)')
+    # parser.add_argument('--random-erase', default=0.0, type=float, help='random erasing probability (default: 0.0)')
+
+    # Mixed precision training parameters
+    parser.add_argument('--apex', action='store_true',
+                        help='Use apex for mixed precision training')
+    parser.add_argument('--apex-opt-level', default='O1', type=str,
+                        help='For apex mixed precision training'
+                             'O0 for FP32 training, O1 for mixed precision training.'
+                             'For further detail, see https://github.com/NVIDIA/apex/tree/master/examples/imagenet'
+                        )
+
+    # distributed training parameters
+    parser.add_argument('--world-size', default=1, type=int, help='number of distributed processes')
+    parser.add_argument('--dist-url', default='env://', help='url used to set up distributed training')
+
+    return parser
+
+
+if __name__ == "__main__":
+    args = get_args_parser().parse_args()
+    main(args)
