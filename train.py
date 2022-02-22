@@ -11,7 +11,13 @@ import torchvision
 import transforms as T
 import utils
 import wandb
+from torchvision.transforms.functional import to_pil_image
+from torchcam.utils import overlay_mask
 from sklearn.metrics import classification_report
+# from torchcam.methods import CAM, GradCAM, SmoothGradCAMpp
+from pytorch_grad_cam import GradCAM, ScoreCAM, GradCAMPlusPlus, AblationCAM, XGradCAM, EigenCAM, FullGrad
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+from pytorch_grad_cam.utils.image import show_cam_on_image
 
 
 try:
@@ -50,7 +56,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, pri
     return metric_logger.loss.value, metric_logger.acc.value
 
 
-def evaluate(model, criterion, data_loader, visualize, output_dir, device, print_freq=100):
+def evaluate(model, criterion, data_loader, visualize, output_dir, cam_extractor, device, print_freq=100):
     model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
@@ -79,26 +85,31 @@ def evaluate(model, criterion, data_loader, visualize, output_dir, device, print
             metric_logger.meters['acc'].update(acc[0].item(), n=batch_size)
 
             if visualize:
+                activation_map = cam_extractor(input_tensor=output, target_category=target, aug_smooth=True,
+                                               eigen_smooth=True)
                 for i in range(len(im)):
+                    # Resize the CAM and overlay it
                     orig_img = np.moveaxis(im[i].numpy(), 0, -1) * .2 + .5
+                    grayscale_cam = grayscale_cam[im, :]
+                    visualization = show_cam_on_image(orig_img, grayscale_cam, use_rgb=True)
+                    # activation_map = cam_extractor(input_tensor=output, target_category=target, aug_smooth=True,
+                    #                                eigen_smooth=True)
+                    # result = overlay_mask(to_pil_image(orig_img), to_pil_image(activation_map[0].squeeze(0), mode='F'),
+                    #                       alpha=0.5)
                     fig, ax = plt.subplots()
-                    ax.imshow(orig_img, cmap='gray', vmin=0, vmax=1)
+                    ax.imshow(visualization, vmin=0, vmax=1)
                     ax.set_title('Cell' + str(idx))
                     ax.tick_params(axis='both', labelsize=0, length=0)
                     ax.set(xlabel=("Predicted Label: " + str(pred.t()[0][i].item()) + ' Actual: ' + str(target.cpu()[i].item())))
                     fig.savefig(output_dir + 'visualize/' + str(idx) + '.png')
                     plt.close('all')
                     idx += 1
+                    cam_extractor.clear_hooks()
 
             # free memory
             del image
             del target
             del output
-    # target_names = ['Clean', 'E1 25-75mm Crack <2/cell', 'E1 >75mm Crack', 'E1 x-BB Crack', 'E2 Fishbone', 'E3 Solder',
-    #                 'E4 Dead Cell', 'E5 Chip <=5%', 'E5 Chip >5%', 'E6 Fingers <=5%', 'E6 Fingers >5%',
-    #                 'E7 Current Mismatch', 'E8 Dark Spot <=10%', 'E8 Dark Spot >10%', 'E9 Firing Belt',
-    #                 'E10 Wafer Impurity', 'EL Scratch', 'Glass', 'Frame',	'Sealant', 'Backsheet', 'Cables',
-    #                 'X-crack <25mm', 'Wild_2', 'Wild_3']
     target_names = ['Normal', 'Pneumonia']
     results = classification_report(target_class, pred_class, target_names=target_names)
     print(results)
@@ -125,7 +136,7 @@ def _get_cache_path(filepath):
 
 def load_data(traindir, valdir, testdir, args):
     # Data loading code
-    resize_size, crop_size = (342, 299) if args.model == 'inception_v3' else (256, 224)
+    resize_size, crop_size = (512, 456) if args.model == 'inception_v3' else (256, 224)
 
     st = time.time()
     cache_path = _get_cache_path(traindir)
@@ -255,7 +266,7 @@ def main(args):
     # creating model
     model = torchvision.models.__dict__[args.model](pretrained=args.pretrained)
 
-    if args.pretrained & (args.model == 'resnet101'):
+    if args.pretrained & (args.model == 'resnet50'):
         count = 0
         for child in model.children():
             count += 1
@@ -264,6 +275,8 @@ def main(args):
             for param in child.parameters():
                 param.requires_grad = False
 
+    target_layers = [model.layer4[-1]]
+    cam_extractor = GradCAM(model=model, target_layers=target_layers, use_cuda=True)
     model.to(device)
     if args.distributed and args.sync_bn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -277,6 +290,8 @@ def main(args):
     elif opt_name == 'rmsprop':
         optimizer = torch.optim.RMSprop(model.parameters(), lr=args.lr, momentum=args.momentum,
                                         weight_decay=args.weight_decay, eps=0.0316, alpha=0.9)
+    elif opt_name == 'adam':
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     else:
         raise RuntimeError("Invalid optimizer {}. Only SGD and RMSprop are supported.".format(args.opt))
 
@@ -285,7 +300,8 @@ def main(args):
                                           opt_level=args.apex_opt_level
                                           )
 
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step_size, gamma=args.lr_gamma)
+    # lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step_size, gamma=args.lr_gamma)
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     model_without_ddp = model
     if args.distributed:
@@ -300,7 +316,7 @@ def main(args):
         args.start_epoch = checkpoint['epoch'] + 1
 
     if args.test_only:
-        evaluate(model, criterion, data_loader_testonly, args.visualize, args.output_dir, device=device)
+        evaluate(model, criterion, data_loader_testonly, args.visualize, args.output_dir, cam_extractor, device=device)
         return
 
     if args.wandb:
@@ -322,7 +338,8 @@ def main(args):
             train_sampler.set_epoch(epoch)
         loss_train, acc_train = train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args.print_freq, args.apex)
         lr_scheduler.step()
-        loss_val, acc_val = evaluate(model, criterion, data_loader_test, False, args.output_dir, device=device)
+        loss_val, acc_val = evaluate(model, criterion, data_loader_test, False, args.output_dir, cam_extractor,
+                                     device=device)
 
         if args.wandb:
             # log loss and accuracies
@@ -355,7 +372,8 @@ def main(args):
     if args.visualize:
         checkpoint = torch.load(os.path.join(args.output_dir, 'best_model.pth'), map_location='cpu')
         model.load_state_dict(checkpoint['model'], strict=not args.test_only)
-        test_loss, test_acc = evaluate(model, criterion, data_loader_testonly, True, args.output_dir, device=device)
+        test_loss, test_acc = evaluate(model, criterion, data_loader_testonly, True, args.output_dir, cam_extractor,
+                                       device=device)
         if args.wandb:
             # log loss and accuracies
             wandb.log({
@@ -372,24 +390,24 @@ def get_args_parser(add_help=True):
     import argparse
     parser = argparse.ArgumentParser(description='PyTorch Classification Training', add_help=add_help)
 
-    parser.add_argument('--wandb', default=True, help='weights and bias')
+    parser.add_argument('--wandb', default=False, help='weights and bias')
     parser.add_argument('--data-path', default='../../../datasets/chest_xray/', help='dataset')
     parser.add_argument('--anno-dir', default='files/')
     parser.add_argument('--model', default='resnet50', help='model')
     parser.add_argument('--device', default='cuda', help='device')
     parser.add_argument('-b', '--batch-size', default=16, type=int)
-    parser.add_argument('--epochs', default=50, type=int, metavar='N',
+    parser.add_argument('--epochs', default=1, type=int, metavar='N',
                         help='number of total epochs to run')
     parser.add_argument('-j', '--workers', default=8, type=int, metavar='N',
                         help='number of data loading workers (default: 16)')
-    parser.add_argument('--opt', default='sgd', type=str, help='optimizer')
-    parser.add_argument('--lr', default=0.1, type=float, help='initial learning rate')
+    parser.add_argument('--opt', default='adam', type=str, help='optimizer')
+    parser.add_argument('--lr', default=0.001, type=float, help='initial learning rate')
     parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                         help='momentum')
     parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
                         metavar='W', help='weight decay (default: 1e-4)',
                         dest='weight_decay')
-    parser.add_argument('--lr-step-size', default=30, type=int, help='decrease lr every step-size epochs')
+    parser.add_argument('--lr-step-size', default=20, type=int, help='decrease lr every step-size epochs')
     parser.add_argument('--lr-gamma', default=0.1, type=float, help='decrease lr by a factor of lr-gamma')
     parser.add_argument('--print-freq', default=10, type=int, help='print frequency')
     parser.add_argument('--output-dir', default='Test/', help='path where to save')
@@ -418,7 +436,7 @@ def get_args_parser(add_help=True):
     parser.add_argument(
         "--pretrained",
         dest="pretrained",
-        default=False,
+        default=True,
         help="Use pre-trained models from the modelzoo",
         action="store_true",
     )
