@@ -63,10 +63,10 @@ def evaluate(model, criterion, data_loader, visualize, output_dir, cam_extractor
     idx = 1
     target_class = torch.Tensor([])
     pred_class = torch.Tensor([])
-    with torch.no_grad():
+    if visualize:
         for image, target in metric_logger.log_every(data_loader, print_freq, header):
-            if visualize:
-                im = image
+
+            im = image
 
             target_class = torch.cat((target_class, target), dim=0)
 
@@ -84,32 +84,53 @@ def evaluate(model, criterion, data_loader, visualize, output_dir, cam_extractor
             metric_logger.update(loss=loss.item())
             metric_logger.meters['acc'].update(acc[0].item(), n=batch_size)
 
-            if visualize:
-                activation_map = cam_extractor(input_tensor=output, target_category=target, aug_smooth=True,
-                                               eigen_smooth=True)
-                for i in range(len(im)):
-                    # Resize the CAM and overlay it
-                    orig_img = np.moveaxis(im[i].numpy(), 0, -1) * .2 + .5
-                    grayscale_cam = grayscale_cam[im, :]
-                    visualization = show_cam_on_image(orig_img, grayscale_cam, use_rgb=True)
-                    # activation_map = cam_extractor(input_tensor=output, target_category=target, aug_smooth=True,
-                    #                                eigen_smooth=True)
-                    # result = overlay_mask(to_pil_image(orig_img), to_pil_image(activation_map[0].squeeze(0), mode='F'),
-                    #                       alpha=0.5)
-                    fig, ax = plt.subplots()
-                    ax.imshow(visualization, vmin=0, vmax=1)
-                    ax.set_title('Cell' + str(idx))
-                    ax.tick_params(axis='both', labelsize=0, length=0)
-                    ax.set(xlabel=("Predicted Label: " + str(pred.t()[0][i].item()) + ' Actual: ' + str(target.cpu()[i].item())))
-                    fig.savefig(output_dir + 'visualize/' + str(idx) + '.png')
-                    plt.close('all')
-                    idx += 1
-                    cam_extractor.clear_hooks()
-
+            activation_map = cam_extractor(input_tensor=image, aug_smooth=True, eigen_smooth=True)
+            for i in range(len(im)):
+                # Resize the CAM and overlay it
+                orig_img = np.moveaxis(im[i].numpy(), 0, -1) * .2 + .5
+                grayscale_cam = activation_map[i, :]
+                visualization = show_cam_on_image(orig_img, grayscale_cam, use_rgb=True)
+                # activation_map = cam_extractor(input_tensor=output, target_category=target, aug_smooth=True,
+                #                                eigen_smooth=True)
+                # result = overlay_mask(to_pil_image(orig_img), to_pil_image(activation_map[0].squeeze(0), mode='F'),
+                #                       alpha=0.5)
+                fig, ax = plt.subplots()
+                ax.imshow(visualization, vmin=0, vmax=1)
+                ax.set_title('Cell' + str(idx))
+                ax.tick_params(axis='both', labelsize=0, length=0)
+                ax.set(xlabel=("Predicted Label: " + str(pred.t()[0][i].item()) + ' Actual: ' + str(
+                    target.cpu()[i].item())))
+                fig.savefig(output_dir + 'visualize/' + str(idx) + '.png')
+                plt.close('all')
+                idx += 1
             # free memory
             del image
             del target
             del output
+    else:
+        with torch.no_grad():
+            for image, target in metric_logger.log_every(data_loader, print_freq, header):
+
+                target_class = torch.cat((target_class, target), dim=0)
+
+                image = image.to(device, non_blocking=True)
+                target = target.to(device, non_blocking=True)
+                output = model(image)
+                _, pred = output.topk(1, 1, True, True)
+                loss = criterion(output, target)
+
+                acc = utils.accuracy(output, target)
+
+                pred_class = torch.cat((pred_class, pred.cpu()), dim=0)
+
+                batch_size = image.shape[0]
+                metric_logger.update(loss=loss.item())
+                metric_logger.meters['acc'].update(acc[0].item(), n=batch_size)
+
+                # free memory
+                del image
+                del target
+                del output
     target_names = ['Normal', 'Pneumonia']
     results = classification_report(target_class, pred_class, target_names=target_names)
     print(results)
@@ -320,15 +341,16 @@ def main(args):
         return
 
     if args.wandb:
-        # for weights and bias tracking
-        wandb.init(project="cap5516assignment1", entity="joefioresi718")
-
         # weights and bias tracking setup
         wandb.config = {
             "learning_rate": args.lr,
             "epochs": args.epochs,
             "batch_size": args.batch_size
         }
+
+        # for weights and bias tracking
+        wandb.init(config=wandb.config, project="cap5516assignment1", entity="joefioresi718")
+
 
     # start training
     start_time = time.time()
@@ -390,13 +412,13 @@ def get_args_parser(add_help=True):
     import argparse
     parser = argparse.ArgumentParser(description='PyTorch Classification Training', add_help=add_help)
 
-    parser.add_argument('--wandb', default=False, help='weights and bias')
+    parser.add_argument('--wandb', default=True, help='weights and bias')
     parser.add_argument('--data-path', default='../../../datasets/chest_xray/', help='dataset')
     parser.add_argument('--anno-dir', default='files/')
     parser.add_argument('--model', default='resnet50', help='model')
     parser.add_argument('--device', default='cuda', help='device')
     parser.add_argument('-b', '--batch-size', default=16, type=int)
-    parser.add_argument('--epochs', default=1, type=int, metavar='N',
+    parser.add_argument('--epochs', default=50, type=int, metavar='N',
                         help='number of total epochs to run')
     parser.add_argument('-j', '--workers', default=8, type=int, metavar='N',
                         help='number of data loading workers (default: 16)')
