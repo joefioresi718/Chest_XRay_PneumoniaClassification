@@ -11,10 +11,7 @@ import torchvision
 import transforms as T
 import utils
 import wandb
-from torchvision.transforms.functional import to_pil_image
-from torchcam.utils import overlay_mask
 from sklearn.metrics import classification_report
-# from torchcam.methods import CAM, GradCAM, SmoothGradCAMpp
 from pytorch_grad_cam import GradCAM, ScoreCAM, GradCAMPlusPlus, AblationCAM, XGradCAM, EigenCAM, FullGrad
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 from pytorch_grad_cam.utils.image import show_cam_on_image
@@ -56,7 +53,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, pri
     return metric_logger.loss.value, metric_logger.acc.value
 
 
-def evaluate(model, criterion, data_loader, visualize, output_dir, cam_extractor, device, print_freq=100):
+def evaluate(model, criterion, data_loader, visualize, output_dir, device, print_freq=100):
     model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
@@ -64,49 +61,51 @@ def evaluate(model, criterion, data_loader, visualize, output_dir, cam_extractor
     target_class = torch.Tensor([])
     pred_class = torch.Tensor([])
     if visualize:
-        for image, target in metric_logger.log_every(data_loader, print_freq, header):
+        target_layers = [model.layer4[-1]]
+        with GradCAM(model=model, target_layers=target_layers) as cam_extractor:
+            for image, target in metric_logger.log_every(data_loader, print_freq, header):
 
-            im = image
+                im = image
 
-            target_class = torch.cat((target_class, target), dim=0)
+                target_class = torch.cat((target_class, target), dim=0)
 
-            image = image.to(device, non_blocking=True)
-            target = target.to(device, non_blocking=True)
-            output = model(image)
-            _, pred = output.topk(1, 1, True, True)
-            loss = criterion(output, target)
+                image = image.to(device, non_blocking=True)
+                target = target.to(device, non_blocking=True)
+                output = model(image)
+                _, pred = output.topk(1, 1, True, True)
+                loss = criterion(output, target)
 
-            acc = utils.accuracy(output, target)
+                acc = utils.accuracy(output, target)
 
-            pred_class = torch.cat((pred_class, pred.cpu()), dim=0)
+                pred_class = torch.cat((pred_class, pred.cpu()), dim=0)
 
-            batch_size = image.shape[0]
-            metric_logger.update(loss=loss.item())
-            metric_logger.meters['acc'].update(acc[0].item(), n=batch_size)
+                batch_size = image.shape[0]
+                metric_logger.update(loss=loss.item())
+                metric_logger.meters['acc'].update(acc[0].item(), n=batch_size)
 
-            activation_map = cam_extractor(input_tensor=image, aug_smooth=True, eigen_smooth=True)
-            for i in range(len(im)):
-                # Resize the CAM and overlay it
-                orig_img = np.moveaxis(im[i].numpy(), 0, -1) * .2 + .5
-                grayscale_cam = activation_map[i, :]
-                visualization = show_cam_on_image(orig_img, grayscale_cam, use_rgb=True)
-                # activation_map = cam_extractor(input_tensor=output, target_category=target, aug_smooth=True,
-                #                                eigen_smooth=True)
-                # result = overlay_mask(to_pil_image(orig_img), to_pil_image(activation_map[0].squeeze(0), mode='F'),
-                #                       alpha=0.5)
-                fig, ax = plt.subplots()
-                ax.imshow(visualization, vmin=0, vmax=1)
-                ax.set_title('Cell' + str(idx))
-                ax.tick_params(axis='both', labelsize=0, length=0)
-                ax.set(xlabel=("Predicted Label: " + str(pred.t()[0][i].item()) + ' Actual: ' + str(
-                    target.cpu()[i].item())))
-                fig.savefig(output_dir + 'visualize/' + str(idx) + '.png')
-                plt.close('all')
-                idx += 1
-            # free memory
-            del image
-            del target
-            del output
+                activation_map = cam_extractor(input_tensor=image, aug_smooth=True, eigen_smooth=True)
+                for i in range(len(im)):
+                    # Resize the CAM and overlay it
+                    orig_img = np.moveaxis(im[i].numpy(), 0, -1) * .2 + .5
+                    grayscale_cam = activation_map[i, :]
+                    visualization = show_cam_on_image(orig_img, grayscale_cam, use_rgb=True)
+                    # activation_map = cam_extractor(input_tensor=output, target_category=target, aug_smooth=True,
+                    #                                eigen_smooth=True)
+                    # result = overlay_mask(to_pil_image(orig_img), to_pil_image(activation_map[0].squeeze(0), mode='F'),
+                    #                       alpha=0.5)
+                    fig, ax = plt.subplots()
+                    ax.imshow(visualization, vmin=0, vmax=1)
+                    ax.set_title('Cell' + str(idx))
+                    ax.tick_params(axis='both', labelsize=0, length=0)
+                    ax.set(xlabel=("Predicted Label: " + str(pred.t()[0][i].item()) + ' Actual: ' + str(
+                        target.cpu()[i].item())))
+                    fig.savefig(output_dir + 'visualize/' + str(idx) + '.png')
+                    plt.close('all')
+                    idx += 1
+                # free memory
+                del image
+                del target
+                del output
     else:
         with torch.no_grad():
             for image, target in metric_logger.log_every(data_loader, print_freq, header):
@@ -157,7 +156,7 @@ def _get_cache_path(filepath):
 
 def load_data(traindir, valdir, testdir, args):
     # Data loading code
-    resize_size, crop_size = (512, 456) if args.model == 'inception_v3' else (256, 224)
+    resize_size, crop_size = (342, 299) if args.model == 'inception_v3' else (256, 224)
 
     st = time.time()
     cache_path = _get_cache_path(traindir)
@@ -171,9 +170,7 @@ def load_data(traindir, valdir, testdir, args):
         dataset = torchvision.datasets.ImageFolder(
             traindir,
             get_transform(True, base_size=resize_size, crop_size=crop_size))
-        # dataset = dataloader.ProductionLineAnalysisDataset(anno_dir=args.anno_dir, img_path=args.data_path,
-        #                                                    transform=get_transform(True, resize_size, crop_size),
-        #                                                    test_mode=False)
+
         if args.cache_dataset:
             print("Saving dataset_train to {}".format(cache_path))
             utils.mkdir(os.path.dirname(cache_path))
@@ -190,9 +187,6 @@ def load_data(traindir, valdir, testdir, args):
         dataset_test = torchvision.datasets.ImageFolder(
             valdir,
             get_transform(False, base_size=resize_size, crop_size=crop_size))
-        # dataset_test = dataloader.ProductionLineAnalysisDataset(anno_dir=args.anno_dir, img_path=args.data_path,
-        #                                                         transform=get_transform(False, resize_size, crop_size),
-        #                                                         test_mode=True)
         if args.cache_dataset:
             print("Saving dataset_test to {}".format(cache_path))
             utils.mkdir(os.path.dirname(cache_path))
@@ -208,9 +202,6 @@ def load_data(traindir, valdir, testdir, args):
             dataset_testonly = torchvision.datasets.ImageFolder(
                 testdir,
                 get_transform(False, base_size=resize_size, crop_size=crop_size))
-            # dataset_test = dataloader.ProductionLineAnalysisDataset(anno_dir=args.anno_dir, img_path=args.data_path,
-            #                                                         transform=get_transform(False, resize_size, crop_size),
-            #                                                         test_mode=True)
             if args.cache_dataset:
                 print("Saving dataset_testonly to {}".format(cache_path))
                 utils.mkdir(os.path.dirname(cache_path))
@@ -240,7 +231,6 @@ def get_transform(train, base_size, crop_size):
         transforms.append(T.RandomHorizontalFlip(0.5))
         transforms.append(T.RandomVerticalFlip(0.5))
         transforms.append(T.RandomRotate90(0.5))
-        # transforms.append(T.RandomMinorRotate(5))
         transforms.append(T.GaussianBlur((7, 7), 2))
     else:
         transforms.append(T.CenterCrop(crop_size))
@@ -296,8 +286,6 @@ def main(args):
             for param in child.parameters():
                 param.requires_grad = False
 
-    target_layers = [model.layer4[-1]]
-    cam_extractor = GradCAM(model=model, target_layers=target_layers, use_cuda=True)
     model.to(device)
     if args.distributed and args.sync_bn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -337,7 +325,7 @@ def main(args):
         args.start_epoch = checkpoint['epoch'] + 1
 
     if args.test_only:
-        evaluate(model, criterion, data_loader_testonly, args.visualize, args.output_dir, cam_extractor, device=device)
+        evaluate(model, criterion, data_loader_testonly, args.visualize, args.output_dir, device=device)
         return
 
     if args.wandb:
@@ -360,8 +348,7 @@ def main(args):
             train_sampler.set_epoch(epoch)
         loss_train, acc_train = train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args.print_freq, args.apex)
         lr_scheduler.step()
-        loss_val, acc_val = evaluate(model, criterion, data_loader_test, False, args.output_dir, cam_extractor,
-                                     device=device)
+        loss_val, acc_val = evaluate(model, criterion, data_loader_test, False, args.output_dir, device=device)
 
         if args.wandb:
             # log loss and accuracies
@@ -394,8 +381,7 @@ def main(args):
     if args.visualize:
         checkpoint = torch.load(os.path.join(args.output_dir, 'best_model.pth'), map_location='cpu')
         model.load_state_dict(checkpoint['model'], strict=not args.test_only)
-        test_loss, test_acc = evaluate(model, criterion, data_loader_testonly, True, args.output_dir, cam_extractor,
-                                       device=device)
+        test_loss, test_acc = evaluate(model, criterion, data_loader_testonly, False, args.output_dir, device=device)
         if args.wandb:
             # log loss and accuracies
             wandb.log({
@@ -417,13 +403,13 @@ def get_args_parser(add_help=True):
     parser.add_argument('--anno-dir', default='files/')
     parser.add_argument('--model', default='resnet50', help='model')
     parser.add_argument('--device', default='cuda', help='device')
-    parser.add_argument('-b', '--batch-size', default=16, type=int)
+    parser.add_argument('-b', '--batch-size', default=32, type=int)
     parser.add_argument('--epochs', default=50, type=int, metavar='N',
                         help='number of total epochs to run')
     parser.add_argument('-j', '--workers', default=8, type=int, metavar='N',
                         help='number of data loading workers (default: 16)')
-    parser.add_argument('--opt', default='adam', type=str, help='optimizer')
-    parser.add_argument('--lr', default=0.001, type=float, help='initial learning rate')
+    parser.add_argument('--opt', default='sgd', type=str, help='optimizer')
+    parser.add_argument('--lr', default=0.05, type=float, help='initial learning rate')
     parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                         help='momentum')
     parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
@@ -458,7 +444,7 @@ def get_args_parser(add_help=True):
     parser.add_argument(
         "--pretrained",
         dest="pretrained",
-        default=True,
+        default=False,
         help="Use pre-trained models from the modelzoo",
         action="store_true",
     )
